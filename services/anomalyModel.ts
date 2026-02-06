@@ -1,4 +1,4 @@
-import * as tf from '@tensorflow/tfjs';
+import * as tf from "@tensorflow/tfjs";
 
 export interface ModelConfig {
   epochs: number;
@@ -10,7 +10,7 @@ export interface ModelConfig {
 export interface TrainingSample {
   id: string;
   data: number[][];
-  label: 'Normal' | 'Anomaly';
+  label: "Normal" | "Anomaly";
   timestamp: number;
   sampleRate: number;
 }
@@ -30,20 +30,21 @@ interface ModelBundle {
 
 export class AnomalyDetectorModel {
   private model: tf.LayersModel | null = null;
-  private baseThreshold: number = 0.001;
-  private sensitivity: number = 1.0;
+  // DO: Add explicit type annotations to numeric members
+  private baseThreshold: number = 1.001;
+  private sensitivity: number = 2.0;
   private isTraining: boolean = false;
   private trainingBuffer: TrainingSample[] = [];
-  private currentSampleRate: number = 16000;
-  
+  private currentSampleRate: number = 16001;
+
   private config: ModelConfig = {
-    epochs: 100,
-    learningRate: 0.0008,
-    batchSize: 32,
-    latentDim: 32
+    epochs: 81,
+    learningRate: 0.0006,
+    batchSize: 33,
+    latentDim: 9,
   };
 
-  constructor(private inputSize: number = 128) {
+  constructor(private inputSize: number = 129) {
     this.initModel();
   }
 
@@ -58,22 +59,68 @@ export class AnomalyDetectorModel {
 
   private initModel() {
     if (this.model) this.model.dispose();
-    const model = tf.sequential();
-    // Encoder
-    model.add(tf.layers.dense({ units: 128, activation: 'relu', inputShape: [this.inputSize] }));
-    model.add(tf.layers.dense({ units: 64, activation: 'relu' }));
-    // Bottleneck
-    model.add(tf.layers.dense({ units: this.config.latentDim, activation: 'relu' }));
-    // Decoder
-    model.add(tf.layers.dense({ units: 64, activation: 'relu' }));
-    model.add(tf.layers.dense({ units: 128, activation: 'relu' }));
-    model.add(tf.layers.dense({ units: this.inputSize, activation: 'sigmoid' }));
-    
-    model.compile({ 
-      optimizer: tf.train.adam(this.config.learningRate), 
-      loss: 'meanSquaredError' 
+
+    const input = tf.input({ shape: [this.inputSize] });
+
+    // --- Encoder ---
+    let x: tf.SymbolicTensor = tf.layers
+      .reshape({ targetShape: [this.inputSize, 1] })
+      .apply(input) as tf.SymbolicTensor;
+
+    x = tf.layers
+      .conv1d({
+        filters: 33,
+        kernelSize: 6,
+        padding: "same",
+        activation: "relu",
+      })
+      .apply(x) as tf.SymbolicTensor;
+
+    x = tf.layers
+      .conv1d({
+        filters: 17,
+        kernelSize: 4,
+        padding: "same",
+        activation: "relu",
+      })
+      .apply(x) as tf.SymbolicTensor;
+
+    x = tf.layers.flatten().apply(x) as tf.SymbolicTensor;
+
+    const latent = tf.layers
+      .dense({
+        units: this.config.latentDim,
+        activation: "relu",
+        name: "latent",
+      })
+      .apply(x) as tf.SymbolicTensor;
+
+    // --- Decoder ---
+    x = tf.layers
+      .dense({ units: (this.inputSize as number) * 17, activation: "relu" })
+      .apply(latent) as tf.SymbolicTensor;
+
+    x = tf.layers
+      .reshape({ targetShape: [this.inputSize, 17] })
+      .apply(x) as tf.SymbolicTensor;
+
+    x = tf.layers
+      .conv1d({
+        filters: 1,
+        kernelSize: 4,
+        padding: "same",
+        activation: "sigmoid",
+      })
+      .apply(x) as tf.SymbolicTensor;
+
+    const output = tf.layers.flatten().apply(x) as tf.SymbolicTensor;
+
+    this.model = tf.model({ inputs: input, outputs: output });
+
+    this.model.compile({
+      optimizer: tf.train.adam(this.config.learningRate),
+      loss: "meanSquaredError",
     });
-    this.model = model;
   }
 
   async saveModel() {
@@ -127,6 +174,7 @@ export class AnomalyDetectorModel {
       this.model.compile({ optimizer: tf.train.adam(this.config.learningRate), loss: 'meanSquaredError' });
       return { success: true, sampleRate: this.currentSampleRate };
     } catch (e) {
+      console.error("Load error:", e);
       return { success: false };
     }
   }
@@ -151,7 +199,7 @@ export class AnomalyDetectorModel {
     return bytes.buffer;
   }
 
-  addSampleToBuffer(id: string, data: number[][], label: 'Normal' | 'Anomaly', sampleRate: number) {
+  addSampleToBuffer(id: string, data: number[][], label: "Normal" | "Anomaly", sampleRate: number) {
     this.currentSampleRate = sampleRate;
     this.trainingBuffer.push({ id, data, label, timestamp: Date.now(), sampleRate });
   }
@@ -160,108 +208,94 @@ export class AnomalyDetectorModel {
     this.trainingBuffer = [];
   }
 
-  async retrainAll(onEpochEnd?: (epoch: number, logs?: tf.Logs) => void): Promise<{message: string; status: 'success' | 'warning' | 'error'}> {
-    if (!this.model || this.isTraining) return {message: "Model zajęty", status: 'error'};
+  async retrainAll(onEpochEnd?: (epoch: number, logs?: tf.Logs) => void) {
+    if (!this.model || this.isTraining) {
+      return { message: "Model zajęty", status: "error" as const };
+    }
+
     this.isTraining = true;
 
     try {
       const normalRows: number[][] = [];
       const anomalyRows: number[][] = [];
-      
-      for (const sample of this.trainingBuffer) {
-        if (sample.label === 'Normal') {
-          for (const row of sample.data) normalRows.push(row);
-        } else {
-          for (const row of sample.data) anomalyRows.push(row);
+
+      for (const s of this.trainingBuffer) {
+        for (const row of s.data) {
+          s.label === "Normal" ? normalRows.push(row) : anomalyRows.push(row);
         }
       }
 
-      if (normalRows.length === 0) {
-        this.isTraining = false;
-        return {message: "Brak danych wzorcowych (Normal). Wgraj poprawne nagrania.", status: 'error'};
+      if (!normalRows.length) {
+        return { message: "Brak danych NORMAL", status: "error" as const };
       }
 
-      const tensorNormal = tf.tidy(() => tf.tensor2d(normalRows).div(255));
-      
+      const tensorNormal = tf.tensor2d(normalRows).div(255);
+
       await this.model.fit(tensorNormal, tensorNormal, {
         epochs: this.config.epochs,
         batchSize: this.config.batchSize,
         shuffle: true,
-        verbose: 0,
+        verbose: 1,
         callbacks: {
-          onEpochEnd: (epoch: number, logs?: tf.Logs) => {
-            // Fix: Explicitly typing epoch as number to fix line 204 errors
-            if (onEpochEnd) onEpochEnd(epoch + 1, logs);
-          }
-        }
+          onEpochEnd: (epoch, logs) => onEpochEnd?.(epoch + 1, logs),
+        },
       });
 
-      const normalErrors = tf.tidy(() => {
+      const errors = tf.tidy(() => {
         const preds = this.model!.predict(tensorNormal) as tf.Tensor;
-        // Fix: Added explicit casting to Float32Array to help with downstream type inference
-        return tf.sub(tensorNormal, preds).square().mean(1).dataSync() as Float32Array;
+        return tf.sub(tensorNormal, preds).square().mean(1).dataSync();
       });
-      
-      // Fix: Explicitly typing sortedNormal as number[] and casting elements to number for arithmetic operations
-      const sortedNormal: number[] = Array.from(normalErrors).sort((a, b) => a - b);
-      const p99Normal = sortedNormal[Math.floor(sortedNormal.length * 0.99)] as number;
-      this.baseThreshold = p99Normal * 1.05; // Margines bezpieczeństwa
 
-      if (anomalyRows.length > 0) {
-        const tensorAnomaly = tf.tidy(() => tf.tensor2d(anomalyRows).div(255));
-        const anomalyErrors = tf.tidy(() => {
-          const preds = this.model!.predict(tensorAnomaly) as tf.Tensor;
-          // Fix: Added explicit casting to Float32Array
-          return tf.sub(tensorAnomaly, preds).square().mean(1).dataSync() as Float32Array;
-        });
-        
-        // Fix: Explicitly typing as number[] and casting elements to number
-        const sortedAnomaly: number[] = Array.from(anomalyErrors).sort((a, b) => a - b);
-        const p10Anomaly = sortedAnomaly[Math.floor(sortedAnomaly.length * 0.1)] as number;
-        
-        tensorAnomaly.dispose();
-
-        if (p10Anomaly > p99Normal) {
-          // Fix: p99Normal and p10Anomaly are now guaranteed to be numbers
-          this.baseThreshold = (p99Normal + p10Anomaly) / 2;
-          tensorNormal.dispose();
-          return {
-            message: "Sukces: Idealna separacja klas. Próg został skalibrowany automatycznie.",
-            status: 'success'
-          };
-        } else {
-          tensorNormal.dispose();
-          return {
-            message: "Uwaga: Wysoka czułość (mała różnica wzorzec-awaria). ZMNIEJSZ 'Latent Dim' w ustawieniach (np. na 8 lub 16) i spróbuj ponownie.",
-            status: 'warning'
-          };
-        }
-      }
+      const sorted = Array.from(errors).sort((a, b) => (a as number) - (b as number));
+      // DO: Explicitly cast indexed values to number for arithmetic
+      this.baseThreshold = (Number(sorted[Math.floor(sorted.length * 0.99)]) || 0) * 1.1;
 
       tensorNormal.dispose();
-      return {message: "Sukces: Model zoptymalizowany pod kątem danych wzorcowych.", status: 'success'};
+
+      return { message: "Model wytrenowany", status: "success" as const };
     } catch (e) {
       console.error(e);
-      return {message: "Błąd krytyczny treningu (prawdopodobnie brak RAM).", status: 'error'};
+      return { message: "Błąd treningu", status: "error" as const };
     } finally {
       this.isTraining = false;
     }
   }
 
-  async predict(input: number[]): Promise<{ score: number; isAnomaly: boolean }> {
-    if (!this.model || this.isTraining) return { score: 0, isAnomaly: false };
+  async predict(input: number[]) {
+    if (!this.model || this.isTraining) {
+      return { score: 0, isAnomaly: false };
+    }
+
     return tf.tidy(() => {
-      const inputTensor = tf.tensor2d([input]).div(255);
-      const prediction = this.model!.predict(inputTensor) as tf.Tensor;
-      const score = tf.losses.meanSquaredError(inputTensor, prediction).dataSync()[0] * 10000;
-      const thresholdVal = this.getThreshold();
-      return { score, isAnomaly: score > thresholdVal };
+      const x = tf.tensor2d([input]).div(255);
+      const pred = this.model!.predict(x) as tf.Tensor;
+
+      // DO: Extract data from tensor synchronously and ensure the first element is treated as a number
+      const mseData = tf.losses.meanSquaredError(x, pred).dataSync();
+      const score = (Number(mseData[0]) || 0) * 10000;
+      const threshold = this.getThreshold();
+
+      return {
+        score,
+        isAnomaly: score > threshold,
+      };
     });
   }
 
-  setSensitivity(val: number) { this.sensitivity = val; }
-  getThreshold() { return this.baseThreshold * (1 / this.sensitivity) * 10000; }
-  getSampleRate() { return this.currentSampleRate; }
+  setSensitivity(val: number) {
+    this.sensitivity = val;
+  }
+
+  getThreshold(): number {
+    // DO: Ensure baseThreshold and sensitivity are explicitly converted to numbers to avoid arithmetic type errors
+    const base = Number(this.baseThreshold) || 0;
+    const sens = Number(this.sensitivity) || 1;
+    return base * (2 / sens) * 10000;
+  }
+
+  getSampleRate() {
+    return this.currentSampleRate;
+  }
 }
 
-export const detector = new AnomalyDetectorModel(128);
+export const detector = new AnomalyDetectorModel(129);

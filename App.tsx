@@ -1,16 +1,14 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { 
-  Play, Square, AlertTriangle, BrainCircuit, MicOff, Loader2, GraduationCap, 
+  Play, Square, AlertTriangle, BrainCircuit, MicOff, Loader2, 
   ShieldCheck, ShieldAlert, Upload, FileAudio, History, Download, Settings,
-  Cpu, SlidersHorizontal, Activity, Save, Filter, Database, Search, Mic, Zap, Volume2, Pause, BarChart2, FileSearch, TrendingUp, Clock, Info, FolderOpen, Trash2, ListChecks, ChevronDown, ChevronRight, Terminal, X, Wand2, Sparkles, ZapOff, BookOpen
+  Cpu, SlidersHorizontal, Activity, Save, Filter, Database, Search, Mic, Zap, Volume2, Pause, BarChart2, FileSearch, TrendingUp, Clock, Info, FolderOpen, Trash2, ListChecks, ChevronDown, ChevronRight, Terminal, X, Wand2, Sparkles, ZapOff
 } from 'lucide-react';
 import * as tf from '@tensorflow/tfjs';
 import { Anomaly, AudioChartData } from './types';
 import AnomalyChart from './components/AnomalyChart';
 import ReportTable from './components/ReportTable';
-import SpectralAnalysisChart from './components/SpectralAnalysisChart';
-import ModelDocs from './components/ModelDocs';
 import { detector, ModelConfig } from './services/anomalyModel';
 
 interface FileQueueItem {
@@ -32,7 +30,6 @@ const App: React.FC = () => {
   const [status, setStatus] = useState('System gotowy');
   const [showReport, setShowReport] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  const [showDocs, setShowDocs] = useState(false);
   const [trainingQueue, setTrainingQueue] = useState<FileQueueItem[]>([]);
   const [batchProgress, setBatchProgress] = useState(0);
   const [currentScore, setCurrentScore] = useState(0);
@@ -53,6 +50,7 @@ const App: React.FC = () => {
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const mainAudioRef = useRef<HTMLAudioElement | null>(null);
   const consoleRef = useRef<HTMLDivElement>(null);
+  const isMonitoringRef = useRef(false);
 
   const threshold = detector.getThreshold();
 
@@ -113,6 +111,19 @@ const App: React.FC = () => {
   const updateSensitivity = (val: number) => {
     setSensitivity(val);
     detector.setSensitivity(val);
+  };
+
+  const handleLoadModel = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    addLog(`Wczytywanie sieci: ${file.name}...`, "info");
+    const res = await detector.loadModel(file);
+    if (res.success) {
+      addLog("Model wczytany pomyślnie!", "success");
+      setCurrentSampleRate(res.sampleRate || 16000);
+    } else {
+      addLog("Błąd podczas wczytywania modelu.", "error");
+    }
   };
 
   const autoCalibrate = (silent = false) => {
@@ -192,7 +203,10 @@ const App: React.FC = () => {
           const result: number[][] = [];
           for (let j = 0; j < rawData.length; j += stride) {
             if (result.length >= maxFrames) break;
-            result.push(rawData[j].slice(0, 128).map(v => Math.min(255, v * 1800)));
+            // Pad or trim to 129 bins
+            const row = rawData[j].slice(0, 129).map(v => Math.min(255, v * 1800));
+            while(row.length < 129) row.push(0);
+            result.push(row);
           }
           return result;
         });
@@ -236,7 +250,8 @@ const App: React.FC = () => {
       const newChartData: AudioChartData[] = [];
       const buffer: number[] = [];
       for (let i = 0; i < rawSpectrogram.length; i++) {
-        const frame = rawSpectrogram[i].slice(0, 128).map(v => Math.min(255, v * 1800));
+        const frame = rawSpectrogram[i].slice(0, 129).map(v => Math.min(255, v * 1800));
+        while(frame.length < 129) frame.push(0);
         const { score } = await detector.predict(frame);
         const timestamp = i * frameDurationSec;
         buffer.push(score);
@@ -244,7 +259,7 @@ const App: React.FC = () => {
         const smoothed = buffer.reduce((a,b)=>a+b,0) / buffer.length;
         newChartData.push({
           time: `${timestamp.toFixed(1)}s`,
-          amplitude: frame.reduce((a,b)=>a+b,0)/128/2.55,
+          amplitude: frame.reduce((a,b)=>a+b,0)/129/2.55,
           anomalyLevel: smoothed,
           second: timestamp
         });
@@ -263,41 +278,83 @@ const App: React.FC = () => {
     }
   };
 
+  const stopLive = () => {
+    isMonitoringRef.current = false;
+    mediaStreamRef.current?.getTracks().forEach(t => t.stop());
+    mediaStreamRef.current = null;
+    if (audioContextRef.current) {
+      audioContextRef.current.close().catch(() => {});
+      audioContextRef.current = null;
+    }
+    setMode('IDLE');
+    addLog("Tryb Live wyłączony", "info");
+  };
+
   const startLive = async () => {
     try {
       setMode('MONITORING');
+      isMonitoringRef.current = true;
       setChartData([]);
-      addLog("Tryb Live aktywny", "success");
+      addLog("Inicjalizacja Live Monitor...", "info");
+      
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       mediaStreamRef.current = stream;
-      const audioCtx = new AudioContext();
+      
+      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
       audioContextRef.current = audioCtx;
+      
+      if (audioCtx.state === 'suspended') {
+        await audioCtx.resume();
+      }
+      
       const analyzer = audioCtx.createAnalyser();
-      analyzer.fftSize = 256;
-      audioCtx.createMediaStreamSource(stream).connect(analyzer);
+      analyzer.fftSize = 512;
+      const source = audioCtx.createMediaStreamSource(stream);
+      source.connect(analyzer);
+      
+      addLog("Monitor aktywny", "success");
+      
       const liveBuffer: number[] = [];
+      const freqData = new Float32Array(analyzer.frequencyBinCount);
+      
       const loop = async () => {
-        if (mode !== 'MONITORING') return;
-        const data = new Uint8Array(analyzer.frequencyBinCount);
-        analyzer.getByteFrequencyData(data);
-        const processed = Array.from(data).map((v, i) => (voiceShield && i > 8 && i < 40) ? v * 0.2 : v);
-        const { score } = await detector.predict(processed);
+        if (!isMonitoringRef.current) return;
+        
+        analyzer.getFloatFrequencyData(freqData);
+        
+        // Convert dB to absolute/linear magnitudes similar to STFT training
+        const frame = Array.from(freqData).slice(0, 129).map(db => {
+            const linear = Math.pow(10, db / 20);
+            return Math.min(255, linear * 50000); // Scale to 0-255 range
+        });
+        while(frame.length < 129) frame.push(0);
+
+        const { score } = await detector.predict(frame);
+        
         liveBuffer.push(score);
         if (liveBuffer.length > 5) liveBuffer.shift();
         const smoothed = liveBuffer.reduce((a,b)=>a+b,0) / liveBuffer.length;
+        
         setCurrentScore(smoothed);
-        setChartData(prev => [...prev.slice(-150), {
-          time: new Date().toLocaleTimeString(),
-          amplitude: data.reduce((a,b)=>a+b,0)/data.length/2.55,
-          anomalyLevel: smoothed,
-          second: Date.now()/1000
-        }]);
+        
+        setChartData(prev => {
+          const newData = [...prev, {
+            time: new Date().toLocaleTimeString(),
+            amplitude: frame.reduce((a,b)=>a+b,0)/129/2.55,
+            anomalyLevel: smoothed,
+            second: Date.now()/1000
+          }];
+          return newData.slice(-150);
+        });
+        
         requestAnimationFrame(loop);
       };
+      
       loop();
     } catch (err) {
-      addLog("Mikrofon niedostępny", "error");
+      addLog("Błąd dostępu do mikrofonu", "error");
       setMode('IDLE');
+      isMonitoringRef.current = false;
     }
   };
 
@@ -321,10 +378,6 @@ const App: React.FC = () => {
         </div>
 
         <div className="flex flex-wrap items-center gap-3 bg-slate-900/60 p-3 rounded-[2rem] border border-slate-800 shadow-2xl backdrop-blur-xl">
-           <button onClick={() => setShowDocs(true)} className="flex items-center gap-2 px-4 py-2 bg-indigo-600/10 hover:bg-indigo-600 text-indigo-400 hover:text-white rounded-xl border border-indigo-500/20 transition-all text-[10px] font-black uppercase">
-             <BookOpen className="w-4 h-4" /> Dokumentacja Modelu
-           </button>
-           
            <div className="flex items-center gap-2 bg-slate-800/50 p-2 rounded-2xl border border-slate-700/50">
              <div className="flex flex-col gap-1">
                 <button className="relative group bg-emerald-600/10 hover:bg-emerald-600 text-emerald-500 hover:text-white px-4 py-2 rounded-xl text-[10px] font-black uppercase transition-all flex items-center gap-2 border border-emerald-500/30">
@@ -353,10 +406,14 @@ const App: React.FC = () => {
                 <FileSearch className="w-4 h-4" /> Analiza Pliku
                 <input type="file" accept="audio/*" className="absolute inset-0 opacity-0 cursor-pointer" onChange={(e) => e.target.files?.[0] && analyzeSingleFile(e.target.files[0])} />
               </button>
+              <button className="relative bg-slate-800 hover:bg-slate-700 text-amber-400 px-5 py-3 rounded-2xl text-[11px] font-black uppercase border border-slate-700 flex items-center gap-2">
+                <Upload className="w-4 h-4" /> Wgraj Model
+                <input type="file" accept=".sentinel" className="absolute inset-0 opacity-0 cursor-pointer" onChange={handleLoadModel} />
+              </button>
               {mode !== 'MONITORING' ? (
                 <button onClick={startLive} className="bg-emerald-600 hover:bg-emerald-500 text-white px-6 py-3 rounded-2xl text-[11px] font-black uppercase flex items-center gap-2 transition-all"><Mic className="w-4 h-4" /> Start Live</button>
               ) : (
-                <button onClick={() => { mediaStreamRef.current?.getTracks().forEach(t=>t.stop()); setMode('IDLE'); }} className="bg-red-600 hover:bg-red-500 text-white px-6 py-3 rounded-2xl text-[11px] font-black uppercase flex items-center gap-2 transition-all"><Square className="w-4 h-4" /> Stop</button>
+                <button onClick={stopLive} className="bg-red-600 hover:bg-red-500 text-white px-6 py-3 rounded-2xl text-[11px] font-black uppercase flex items-center gap-2 transition-all"><Square className="w-4 h-4" /> Stop</button>
               )}
            </div>
 
@@ -497,7 +554,6 @@ const App: React.FC = () => {
         </div>
       </main>
 
-      {showDocs && <ModelDocs onClose={() => setShowDocs(false)} />}
       {showSettings && (
         <div className="fixed inset-0 bg-slate-950/90 backdrop-blur-md z-[200] flex items-center justify-center p-4">
           <div className="bg-slate-900 border border-slate-800 rounded-[2rem] w-full max-w-xl p-8 shadow-2xl border-t-indigo-500 border-t-4">
@@ -514,7 +570,7 @@ const App: React.FC = () => {
                  <div className="group relative">
                    <label className="text-[10px] font-black uppercase text-indigo-400 mb-2 block tracking-widest flex items-center gap-1">Latent Dim (Złożoność)</label>
                    <input type="number" value={nnConfig.latentDim} onChange={(e) => updateParam('latentDim', parseInt(e.target.value))} className="w-full bg-indigo-950/30 border border-indigo-500/50 p-3 rounded-xl text-white font-mono text-sm focus:border-indigo-500 outline-none transition-all" />
-                   <p className="text-[8px] text-slate-500 mt-1 uppercase font-bold">Wskazówka: Wartości 4-8 wymuszają na modelu agresywną kompresję - lepsze dla głośnych maszyn.</p>
+                   <p className="text-[8px] text-slate-500 mt-1 uppercase font-bold">Wskazówka: Małe wartości wymuszają większą kompresję.</p>
                  </div>
                  <div>
                    <label className="text-[10px] font-black uppercase text-slate-500 mb-2 block tracking-widest">Szybkość Uczenia</label>
