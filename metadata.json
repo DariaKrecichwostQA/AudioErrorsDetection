@@ -1,0 +1,7 @@
+{
+  "name": "Industrial Sound Anomaly Detector",
+  "description": "A high-performance AI system for detecting mechanical anomalies in factory equipment using Gemini's native audio analysis.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
